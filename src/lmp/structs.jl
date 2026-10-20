@@ -133,6 +133,30 @@ end
 extension_slot(::AELMP) = :lmp
 
 """
+    ConvexHullLMP(; optimizer, iterations = 50, step = 1.0)
+
+Calculates convex hull prices by maximizing the Lagrangian dual of the unit
+commitment problem (see [`ConvexHullOracle`](@ref)) with the projected
+subgradient method, starting from the duals of the LP relaxation:
+
+    π[k+1] = max(π[k] + step / k * g[k] / ‖g[k]‖, lower),   k = 1, …, iterations,
+
+where `g[k]` is a supergradient at `π[k]`. The prices with the best dual value
+are kept. Each iteration solves one MILP per thermal and storage unit with
+`optimizer`. Requires `ShiftFactorsTransmissionExt(lazy = false)`.
+
+Returns locational marginal prices for each bus and time period in the
+solution dictionary, as [`ConventionalLMP`](@ref).
+"""
+Base.@kwdef struct ConvexHullLMP <: UnitCommitmentExtension
+    optimizer::Any
+    iterations::Int = 50
+    step::Float64 = 1.0
+end
+
+extension_slot(::ConvexHullLMP) = :lmp
+
+"""
     NoLMP()
 
 Disables LMP computation. Use this extension to replace the default

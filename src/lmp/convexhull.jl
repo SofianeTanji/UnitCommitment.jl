@@ -3,6 +3,7 @@
 # Released under the modified BSD license. See COPYING.md for more details.
 
 using JuMP
+using LinearAlgebra
 using SparseArrays
 
 # Coupling rows of the Lagrangian dual. In the requirement rows, the shortfall
@@ -162,7 +163,8 @@ with `value`.
 Returns `(; status, value, bound, a)`: the termination status, the objective
 value, a lower bound on the optimal value (the solver's dual bound when the
 block has integer variables), and the share `a = g_b(x)` of the solution as a
-sparse vector indexed like `oracle.keys`.
+sparse vector indexed like `oracle.keys`. If the block is unbounded, `π` is
+outside the domain of the dual: `value` and `bound` are `-Inf` and `a` is zero.
 """
 function solve_block!(
     oracle::ConvexHullOracle,
@@ -182,6 +184,9 @@ function solve_block!(
     end
     JuMP.optimize!(blk.model)
     status = termination_status(blk.model)
+    if status in (DUAL_INFEASIBLE, INFEASIBLE_OR_UNBOUNDED)
+        return (; status, value = -Inf, bound = -Inf, a = spzeros(length(π)))
+    end
     has_values(blk.model) || error("block $(blk.name): $status")
     obj_value = objective_value(blk.model)
     has_int =
@@ -294,4 +299,41 @@ function _ch_variable_keys(m)
         (sym, obj) in object_dictionary(m) if obj isa AbstractDict for
         (k, v) in obj if v isa VariableRef
     ]
+end
+
+function _after_optimize!(
+    instance::UnitCommitmentInstance,
+    model::UnitCommitmentModel,
+    ext::ConvexHullLMP,
+)::Nothing
+    oracle = ConvexHullOracle(instance; optimizer = ext.optimizer)
+    π, _ = _ch_subgradient(oracle, oracle.π0, ext.iterations, ext.step)
+    model.data[:lmp] = OrderedDict(
+        k => -π[i] for (i, (name, k)) in enumerate(oracle.keys) if
+        name == :eq_net_injection
+    )
+    return _update_solution(instance, model, ConventionalLMP())
+end
+
+# Projected subgradient method with step lengths step / k, from π. Stops if π
+# leaves the domain of the dual. Returns the prices with the best dual value,
+# and that value.
+function _ch_subgradient(
+    oracle::ConvexHullOracle,
+    π::AbstractVector{<:Real},
+    iterations::Int,
+    step::Real,
+)
+    best_π, best_value = π, -Inf
+    for k in 1:iterations
+        r = evaluate!(oracle, π)
+        isfinite(r.value) || break
+        if r.value > best_value
+            best_π, best_value = π, r.value
+        end
+        norm_g = norm(r.grad)
+        norm_g == 0 && break
+        π = max.(π .+ step / k .* r.grad ./ norm_g, oracle.lower)
+    end
+    return best_π, best_value
 end

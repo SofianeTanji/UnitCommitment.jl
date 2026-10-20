@@ -88,10 +88,48 @@ end
             1e-6
     end
 
+    # Unbounded system block: reserve price above the shortfall penalty
+    instance =
+        UnitCommitment.read(fixture("case14/base.json"); extensions = [sf])
+    oracle =
+        UnitCommitment.ConvexHullOracle(instance; optimizer = _ch_optimizer())
+    π = copy(oracle.π0)
+    π[findfirst(k -> k[1] == :eq_min_reserve, oracle.keys)] = 1e6
+    @test UnitCommitment.evaluate!(oracle, π).value == -Inf
+
     # Lazy transmission constraints are not supported
     instance = UnitCommitment.read(fixture("case14/base.json"))
     @test_throws ErrorException UnitCommitment.ConvexHullOracle(
         instance;
         optimizer = _ch_optimizer(),
     )
+end
+
+@testfunction lmp_convexhull_lmp_test begin
+    sf = UnitCommitment.ShiftFactorsTransmissionExt(lazy = false)
+    ext = UnitCommitment.ConvexHullLMP(
+        optimizer = _ch_optimizer(),
+        iterations = 5,
+    )
+    instance =
+        UnitCommitment.read(fixture("case14/base.json"); extensions = [sf, ext])
+    model = UnitCommitment.build_model(instance; optimizer = _ch_optimizer())
+    optimize!(model)
+    lmp = solution(model)["LMP: Total (\$/MWh)"]
+
+    # The LMPs are the energy prices found by the subgradient method
+    oracle =
+        UnitCommitment.ConvexHullOracle(instance; optimizer = _ch_optimizer())
+    π, _ = UnitCommitment._ch_subgradient(oracle, oracle.π0, 5, ext.step)
+    for (i, (name, (_, b, t))) in enumerate(oracle.keys)
+        name == :eq_net_injection || continue
+        @test lmp[b][t] ≈ -π[i]
+    end
+
+    # The method recovers the dual value lost by perturbing the prices
+    L0 = UnitCommitment.evaluate!(oracle, oracle.π0).value
+    π1 = max.(oracle.π0 .+ 20 .* (-1) .^ eachindex(oracle.π0), oracle.lower)
+    L1 = UnitCommitment.evaluate!(oracle, π1).value
+    _, best = UnitCommitment._ch_subgradient(oracle, π1, 50, 100.0)
+    @test best >= L1 + 0.9 * (L0 - L1)
 end
