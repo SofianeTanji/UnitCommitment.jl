@@ -14,9 +14,13 @@ cases above case300 (too large with eager contingency constraints).
 On a login node (compute nodes may have no internet access):
 
 ```bash
-curl -fsSL https://install.julialang.org | sh -s -- -y   # juliaup
+# Julia, through juliaup (installed in ~/.juliaup, added to the PATH by ~/.bashrc)
+curl -fsSL https://install.julialang.org | sh -s -- -y
+source ~/.bashrc
 juliaup add 1.12 && juliaup default 1.12
-git clone -b <branch> <repository> && cd UnitCommitment.jl/benchmark/convexhull
+
+git clone -b convex-hull-lmp-benchmark https://github.com/SofianeTanji/UnitCommitment.jl.git
+cd UnitCommitment.jl/benchmark/convexhull
 ./download.sh                                            # instances/
 julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
 mkdir -p logs
