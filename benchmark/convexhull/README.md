@@ -7,7 +7,9 @@ Wentges smoothing and parallel pricing (`dw.jl`), up to a relative gap of 1e-6.
 
 Not included: RTS-GMLC (time-varying minimum power, not supported by the
 default thermal formulation), transmission expansion instances, and MATPOWER
-cases above case300 (too large with eager contingency constraints).
+cases above case300 (too large with eager contingency constraints). MATPOWER
+cases are run for 2017-01-01 only, except case14 (all 365 days, appended at
+the end of `instances.txt`).
 
 ## Running on a CECI cluster (NIC6)
 
