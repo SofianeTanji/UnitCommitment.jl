@@ -7,7 +7,7 @@
 #SBATCH --job-name=chp-dw
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem-per-cpu=1900M
 #SBATCH --time=2-00:00:00
 #SBATCH --output=logs/%A_%a.out
 

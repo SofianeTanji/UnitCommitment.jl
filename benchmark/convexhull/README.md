@@ -27,7 +27,7 @@ mkdir -p logs
 sbatch --array=1-$(wc -l < instances.txt) submit.sh
 ```
 
-Each job uses 8 cores, 32 GB and at most 2 days. When all jobs are done:
+Each job uses 8 cores, 1900 MB per core (the NIC6 maximum) and at most 2 days. When all jobs are done:
 
 ```bash
 julia --project=. collect.jl
