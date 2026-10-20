@@ -5,11 +5,13 @@ Computes `max_π L(π)` (the convex hull pricing dual of
 instances listed in `instances.txt`, by Dantzig–Wolfe column generation with
 Wentges smoothing and parallel pricing (`dw.jl`), up to a relative gap of 1e-6.
 
-Not included: RTS-GMLC (time-varying minimum power, not supported by the
-default thermal formulation), transmission expansion instances, and MATPOWER
-cases above case300 (too large with eager contingency constraints). MATPOWER
-cases are run for 2017-01-01 only, except case14 (all 365 days, appended at
-the end of `instances.txt`).
+Not included: RTS-GMLC and pglib-uc/ca/Scenario400 (time-varying minimum
+power, not supported by the default thermal formulation), transmission
+expansion instances, MATPOWER case300, case89pegase and larger cases (too
+large with eager contingency constraints), and the MATPOWER instances on which
+HiGHS returned OTHER_ERROR (case30 and 46 days of case14). MATPOWER cases are
+run for 2017-01-01 only, except case14 (319 days, at the end of
+`instances.txt`).
 
 ## Running on a CECI cluster (NIC6)
 
