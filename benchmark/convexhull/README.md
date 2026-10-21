@@ -46,3 +46,37 @@ julia --project=. collect.jl
   best lower bound) and the bounds at each iteration.
 - `results.csv`: one row per instance with the scalar fields.
 - `logs/<job>_<index>.out`: Slurm logs.
+
+## Benchmark of the methods
+
+`methods/` holds the methods that maximize `L` (subgradient, bundle, smoothing
+and column generation), with the interface described in `methods/common.jl`.
+`configs.jl` lists the 69 benchmarked configurations, each with at most one
+tuned parameter, and the tuning instances: one per dataset (or-lib,
+pglib-uc/ca, pglib-uc/ferc and matpower/case14), the one with the median gap
+`(L* - L(π0)) / |L*|`. The other instances on which `L(π0)` is not within
+1e-6 of `L*` (137) are the evaluation instances. Every run starts from the LP
+relaxation duals and lasts 300 s, or until `L` is within 1e-6 of `L*`.
+
+The tuning: each tuned configuration runs on each tuning instance for an
+11-value coarse grid of its parameter, then for 4 more values around the best
+one. Then the evaluation runs with the selected values. After the `results/`
+of `submit.sh` are in place:
+
+```bash
+mkdir -p logs
+julia --project=. plan.jl coarse        # tasks/coarse.txt (268 jobs)
+sbatch --array=1-$(wc -l < tasks/coarse.txt) bench.sh tasks/coarse.txt traces/tune
+# when they are done:
+julia --project=. plan.jl fine          # tasks/fine.txt
+sbatch --array=1-$(wc -l < tasks/fine.txt) bench.sh tasks/fine.txt traces/tune
+# when they are done:
+julia --project=. plan.jl select        # tuned.json, and prints the selected values
+julia --project=. plan.jl eval          # tasks/eval.txt (822 jobs of 12 runs)
+sbatch --array=1-$(wc -l < tasks/eval.txt) bench.sh tasks/eval.txt traces/eval
+```
+
+Each job uses 8 cores and at most 4 hours. The traces are in
+`traces/<stage>/<run>/<name>.json`: the parameters, the status (`target`,
+`time_limit`, `optimal`, `unbounded`, `iterations` or `error`), and the time,
+`L`, the certified bound and the method's upper bound at each evaluation.
