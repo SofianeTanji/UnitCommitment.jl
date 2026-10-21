@@ -5,8 +5,8 @@
 #
 # where x are all the block variables and x_lp their values in the LP
 # relaxation. L_σ is smooth, with ∇L_σ(π) = -Σ_b g_b(x̄_b) at the minimizers
-# x̄_b. Blocks without integer variables are solved directly as QPs. For the
-# other blocks, x̄_b is found by column generation: a restricted master QP over
+# x̄_b. Blocks without integer variables are solved directly as QPs, by
+# Clarabel. For the other blocks, x̄_b is found by column generation: a restricted master QP over
 # convex combinations of stored block solutions, and a pricing MILP at the
 # linearization of the prox term, until the certified Frank-Wolfe gap is at
 # most τ (or after max_rounds rounds). The columns are kept between calls.
@@ -79,12 +79,30 @@ function add_column!(S::SmoothBlock, oracle, b)
     return true
 end
 
+# Share of a block without integer variables: its QP with the prox term,
+# solved by Clarabel on a copy of the block model (the HiGHS QP solver fails
+# on some of these blocks)
+function continuous_share(S, oracle, b, π, σ)
+    blk = oracle.blocks[b]
+    obj = copy(blk.cost)
+    for (i, gi) in zip(blk.rows, blk.g)
+        add_to_expression!(obj, -π[i], gi)
+    end
+    prox = (σ / 2) * sum((S.x[i] - S.xr[i])^2 for i in eachindex(S.x))
+    @objective(blk.model, Min, obj + prox)
+    qp = MOI.instantiate(Clarabel.Optimizer; with_bridge_type = Float64)
+    MOI.set(qp, MOI.Silent(), true)
+    map = MOI.copy_to(qp, backend(blk.model))
+    MOI.optimize!(qp)
+    status = MOI.get(qp, MOI.TerminationStatus())
+    status in (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL) || error("block $(blk.name): $status")
+    x = v -> MOI.get(qp, MOI.VariablePrimal(), map[index(v)])
+    return sparsevec(blk.rows, value.(x, blk.g), length(oracle.keys))
+end
+
 # Share -∇ of block b in ∇L_σ(π), i.e. g_b(x̄_b)
 function smooth_share!(S, oracle, b, π, σ, τ, max_rounds)
-    if !any(S.integer)
-        prox = (σ / 2) * sum((S.x[i] - S.xr[i])^2 for i in eachindex(S.x))
-        return UC.solve_block!(oracle, b, π; extra = prox).a
-    end
+    any(S.integer) || return continuous_share(S, oracle, b, π, σ)
     if isempty(S.V)
         UC.solve_block!(oracle, b, π)
         add_column!(S, oracle, b)

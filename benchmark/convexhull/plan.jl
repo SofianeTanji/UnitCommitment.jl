@@ -7,7 +7,8 @@
 #   coarse  tasks/coarse.txt: the coarse grid of every tuned configuration, on
 #           each tuning instance
 #   fine    tasks/fine.txt: the fine grid around the best coarse value, from
-#           the traces in traces/tune
+#           the traces in traces/tune (skips, and lists, the configurations
+#           without their 11 coarse runs)
 #   select  tuned.json: the best value of each configuration on the tuning
 #           instance of each dataset, from all the traces in traces/tune
 #   eval    tasks/eval.txt: every configuration on each benchmark instance
@@ -64,7 +65,10 @@ function main(step)
         lines = String[]
         for name in TUNING, c in tuned_configs()
             done = first.(tuning_runs(c, name))
-            length(done) == 11 || error("$(c.label) on $name: $(length(done)) coarse runs")
+            if length(done) < 11
+                println("skipped $(c.label) on $name: $(length(done)) of 11 coarse runs")
+                continue
+            end
             runs = ["$(c.label)@$v" for v in fine_grid(c, best_value(c, name))]
             isempty(runs) || push!(lines, join([name; runs], " "))
         end
