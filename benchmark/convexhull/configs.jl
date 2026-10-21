@@ -70,7 +70,7 @@ const CONFIGS = [
 
 const CONFIG = Dict(c.label => c for c in CONFIGS)
 
-# Datasets: or-lib, pglib-uc/ca, pglib-uc/ferc and matpower/case14
+# Datasets: or-lib, pglib-uc/ca and pglib-uc/ferc
 dataset(name) = startswith(name, "or-lib") ? "or-lib" : join(split(name, "/")[1:2], "/")
 
 # One tuning instance per dataset: the instance with the median relative gap
@@ -79,14 +79,14 @@ const TUNING = [
     "or-lib/200_0_7_w",
     "pglib-uc/ca/2014-12-01_reserves_3",
     "pglib-uc/ferc/2015-11-02_lw",
-    "matpower/case14/2017-09-04",
 ]
 
-# The benchmark set: the instances solved by dw.jl on which L(π0) is not
-# already within `tol` of L*
+# The benchmark set: the instances of these datasets solved by dw.jl on which
+# L(π0) is not already within `tol` of L*
 function benchmark_instances(; tol = 1e-6)
     names = String[]
     for name in readlines("instances.txt")
+        dataset(name) in dataset.(TUNING) || continue
         file = joinpath("results", "$name.json")
         isfile(file) || continue
         r = JSON.parsefile(file)

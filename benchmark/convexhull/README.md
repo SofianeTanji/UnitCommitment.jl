@@ -53,9 +53,9 @@ julia --project=. collect.jl
 and column generation), with the interface described in `methods/common.jl`.
 `configs.jl` lists the 69 benchmarked configurations, each with at most one
 tuned parameter, and the tuning instances: one per dataset (or-lib,
-pglib-uc/ca, pglib-uc/ferc and matpower/case14), the one with the median gap
+pglib-uc/ca and pglib-uc/ferc), the one with the median gap
 `(L* - L(π0)) / |L*|`. The other instances on which `L(π0)` is not within
-1e-6 of `L*` (137) are the evaluation instances. Every run starts from the LP
+1e-6 of `L*` (79) are the evaluation instances. Every run starts from the LP
 relaxation duals and lasts 300 s, or until `L` is within 1e-6 of `L*`.
 
 The tuning: each tuned configuration runs on each tuning instance for an
