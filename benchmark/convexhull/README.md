@@ -78,6 +78,17 @@ sbatch --array=1-$(wc -l < tasks/eval.txt) bench.sh tasks/eval.txt traces/eval
 sbatch --array=1-$(wc -l < tasks/crg.txt) bench.sh tasks/crg.txt traces/eval
 ```
 
+With `SOLVER=gurobi` (Gurobi from the module of the cluster), the oracle and
+the models of the methods, CRG master included, are solved by Gurobi instead
+of HiGHS and Clarabel. All the evaluated configurations (316 jobs of 14 or 15
+runs):
+
+```bash
+module load releases/2025b Gurobi/13.0.1-GCCcore-14.3.0
+GUROBI_JL_USE_GUROBI_JLL=false julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.build("Gurobi")'
+SOLVER=gurobi sbatch --array=1-$(wc -l < tasks/eval_gurobi.txt) bench.sh tasks/eval_gurobi.txt traces/eval_gurobi
+```
+
 Each job uses 8 cores and at most 4 hours. The traces are in
 `traces/<stage>/<run>/<name>.json`: the parameters, the status (`target`,
 `time_limit`, `optimal`, `unbounded`, `iterations` or `error`), and the time,

@@ -20,8 +20,9 @@
 # other intervals of the unit. The master value is an upper bound, and the
 # method stops when it is at most the best lower bound.
 #
-# The master is a HiGHS model, built in batches through the C API, whose
-# simplex basis is kept between rounds. The dispatch polytopes are sliced from
+# The master is built in batches, and its simplex basis is kept between rounds:
+# a HiGHS model through the C API, or with SOLVER = "gurobi" a Gurobi model
+# through MOI (Gurobi queues the changes until the next solve). The dispatch polytopes are sliced from
 # one sparse matrix per unit (lp_matrix_data of the block model), without the
 # variables that the commitment forces to zero and the rows that the bounds of
 # the other variables imply.
@@ -29,9 +30,14 @@
 const HInt = HiGHS.HighsInt
 
 # Master LP, with the columns and rows of the current batch, whose entries are
-# kept as (row, column, value) until the batch is sent to HiGHS
+# kept as (row, column, value) until the batch is sent to the solver. With
+# Gurobi, a row is one constraint, or two for lo < hi both finite (Gurobi has
+# no ranged rows in MOI), or none if it is free.
 mutable struct CRGMaster
     h::Ptr{Cvoid}
+    grb::Any
+    vars::Vector{MOI.VariableIndex}
+    rows::Vector{Vector{Any}}
     ncol::Int
     nrow::Int
     cost::Vector{Float64}
@@ -44,11 +50,19 @@ mutable struct CRGMaster
     V::Vector{Float64}
 end
 
+const OBJECTIVE = MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}()
+
 function CRGMaster()
+    if SOLVER == "gurobi"
+        grb = MOI.instantiate(lp_optimizer())
+        MOI.set(grb, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        MOI.set(grb, OBJECTIVE, zero(MOI.ScalarAffineFunction{Float64}))
+        return CRGMaster(C_NULL, grb, [], [], 0, 0, [], [], [], [], [], [], [], [])
+    end
     h = HiGHS.Highs_create()
     HiGHS.Highs_setBoolOptionValue(h, "output_flag", false)
     HiGHS.Highs_setIntOptionValue(h, "threads", 1)
-    return CRGMaster(h, 0, 0, [], [], [], [], [], [], [], [])
+    return CRGMaster(h, nothing, [], [], 0, 0, [], [], [], [], [], [], [], [])
 end
 
 function new_col!(M::CRGMaster, cost, lo, hi)
@@ -78,6 +92,7 @@ function flush!(M::CRGMaster)
     nc, nr = length(M.cost), length(M.row_lo)
     old = M.I .<= M.nrow
     any(old .& (M.J .<= M.ncol)) && error("entry in an existing row and column")
+    M.grb === nothing || return flush_gurobi!(M, old)
     if nc > 0
         A = sparse(M.I[old], M.J[old] .- M.ncol, M.V[old], max(M.nrow, 1), nc)
         status = HiGHS.Highs_addCols(M.h, nc, M.cost, M.col_lo, M.col_hi, nnz(A),
@@ -96,11 +111,55 @@ function flush!(M::CRGMaster)
     return
 end
 
-# Solves the master; returns its value and its row duals. The new columns of a
-# batch are at zero in the last basis, which keeps it primal feasible (the
+function flush_gurobi!(M::CRGMaster, old)
+    o = M.grb
+    vars = MOI.add_variables(o, length(M.cost))
+    for (v, lo, hi) in zip(vars, M.col_lo, M.col_hi)
+        if lo == hi
+            MOI.add_constraint(o, v, MOI.EqualTo(lo))
+        else
+            isfinite(lo) && MOI.add_constraint(o, v, MOI.GreaterThan(lo))
+            isfinite(hi) && MOI.add_constraint(o, v, MOI.LessThan(hi))
+        end
+    end
+    MOI.modify(o, OBJECTIVE, [MOI.ScalarCoefficientChange(v, c) for (v, c) in zip(vars, M.cost) if c != 0])
+    append!(M.vars, vars)
+    M.ncol += length(vars)
+    for k in findall(old), c in M.rows[M.I[k]]
+        MOI.modify(o, c, MOI.ScalarCoefficientChange(M.vars[M.J[k]], M.V[k]))
+    end
+    A = sparse(M.J[.!old], M.I[.!old] .- M.nrow, M.V[.!old], M.ncol, length(M.row_lo))
+    for (r, lo, hi) in zip(axes(A, 2), M.row_lo, M.row_hi)
+        ks = nzrange(A, r)
+        f = MOI.ScalarAffineFunction(MOI.ScalarAffineTerm.(A.nzval[ks], M.vars[A.rowval[ks]]), 0.0)
+        sets = lo == hi ? [MOI.EqualTo(lo)] :
+            [[MOI.GreaterThan(lo) for _ in 1:isfinite(lo)]; [MOI.LessThan(hi) for _ in 1:isfinite(hi)]]
+        push!(M.rows, Any[MOI.add_constraint(o, f, s) for s in sets])
+    end
+    M.nrow += length(M.row_lo)
+    foreach(empty!, (M.cost, M.col_lo, M.col_hi, M.row_lo, M.row_hi, M.I, M.J, M.V))
+    return
+end
+
+set_offset!(M::CRGMaster, offset) =
+    M.grb === nothing ? HiGHS.Highs_changeObjectiveOffset(M.h, offset) :
+    MOI.modify(M.grb, OBJECTIVE, MOI.ScalarConstantChange(offset))
+
+free!(M::CRGMaster) = M.grb === nothing ? HiGHS.Highs_destroy(M.h) : finalize(M.grb)
+
+# Solves the master; returns its value and the duals of `rows`. The new columns
+# of a batch are at zero in the last basis, which keeps it primal feasible (the
 # rows of a node are homogeneous in its flow), so the masters after the first
 # are solved by the primal simplex method from the last basis.
-function solve!(M::CRGMaster)
+function solve!(M::CRGMaster, rows)
+    if M.grb !== nothing
+        MOI.optimize!(M.grb)
+        status = MOI.get(M.grb, MOI.TerminationStatus())
+        status == MOI.OPTIMAL || error("master: Gurobi status $status")
+        MOI.set(M.grb, MOI.RawOptimizerAttribute("Method"), 0)
+        dual = [sum(MOI.get(M.grb, MOI.ConstraintDual(), c) for c in M.rows[r]; init = 0.0) for r in rows]
+        return MOI.get(M.grb, MOI.ObjectiveValue()), dual
+    end
     HiGHS.Highs_run(M.h)
     status = HiGHS.Highs_getModelStatus(M.h)
     status == HiGHS.kHighsModelStatusOptimal || error("master: HiGHS model status $status")
@@ -108,7 +167,7 @@ function solve!(M::CRGMaster)
     col_value, col_dual = zeros(M.ncol), zeros(M.ncol)
     row_value, row_dual = zeros(M.nrow), zeros(M.nrow)
     HiGHS.Highs_getSolution(M.h, col_value, col_dual, row_value, row_dual)
-    return HiGHS.Highs_getObjectiveValue(M.h), row_dual
+    return HiGHS.Highs_getObjectiveValue(M.h), row_dual[rows]
 end
 
 # A block model as sparse matrices: lo ≤ A x ≤ hi, xlo ≤ x ≤ xhi, cost c'x +
@@ -441,7 +500,7 @@ function crg(oracle, π0, stop::Stop; instance)
         add_arc!(M, U, nothing, nothing)
     end
     offset = sum(B.offset for B in lp_blocks; init = 0.0) + sum(U.B.offset for U in units; init = 0.0)
-    HiGHS.Highs_changeObjectiveOffset(M.h, offset)
+    set_offset!(M, offset)
     flush!(M)
 
     r = evaluate!(trace, oracle, π0, stop)
@@ -449,9 +508,9 @@ function crg(oracle, π0, stop::Stop; instance)
     add_intervals!(M, units, coupling)
     try
         while true
-            value, dual = solve!(M)
+            value, dual = solve!(M, coupling)
             trace.U = min(trace.U, value)
-            λ = max.(dual[coupling], oracle.lower)
+            λ = max.(dual, oracle.lower)
             r = evaluate!(trace, oracle, λ, stop)
             r.stop && break
             if value <= maximum(trace.bound) + 1e-9 * abs(value)
@@ -464,7 +523,7 @@ function crg(oracle, π0, stop::Stop; instance)
             end
         end
     finally
-        HiGHS.Highs_destroy(M.h)
+        free!(M)
     end
     return trace
 end

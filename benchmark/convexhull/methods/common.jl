@@ -12,6 +12,13 @@
 using UnitCommitment, Clarabel, HiGHS, JuMP, LinearAlgebra, SparseArrays
 const UC = UnitCommitment
 
+# Solver of the oracle MIPs and of the models of the methods, from the
+# environment variable SOLVER: "highs" (the default; Clarabel for the QPs) or
+# "gurobi"
+const SOLVER = get(ENV, "SOLVER", "highs")
+SOLVER in ("highs", "gurobi") || error("SOLVER=$SOLVER: not highs or gurobi")
+SOLVER == "gurobi" && @eval using Gurobi
+
 # Stops after `time_limit` seconds, or once the certified value of L(π) is at
 # least `target`
 Base.@kwdef struct Stop
@@ -64,7 +71,7 @@ function evaluate!(
     blocks = Vector{Any}(undef, length(oracle.blocks))
     Threads.@threads :greedy for b in eachindex(oracle.blocks)
         model = oracle.blocks[b].model
-        set_attribute(model, "mip_rel_gap", gap)
+        set_attribute(model, MOI.RelativeGapTolerance(), gap)
         r = UC.solve_block!(oracle, b, π)
         cost = isfinite(r.value) ? value(oracle.blocks[b].cost) : NaN
         blocks[b] = (; r..., cost)
@@ -96,15 +103,31 @@ function price_box(oracle; radius = 1.0)
     return max.(oracle.lower, oracle.π0 .- R), oracle.π0 .+ R
 end
 
-# Optimizers of the models built by the methods: HiGHS for the column
-# generation masters (LPs, with duals), Clarabel for the bundle and smoothing
-# models (QPs, on which the HiGHS QP solver can stall)
-lp_optimizer() = optimizer_with_attributes(
-    HiGHS.Optimizer,
-    "output_flag" => false,
-    "threads" => 1,
-)
-qp_optimizer() = optimizer_with_attributes(Clarabel.Optimizer, "verbose" => false)
+# Optimizers of the oracle blocks (MIPs, solved up to the relative gap 1e-9 by
+# default), of the column generation masters (LPs, with duals) and of the
+# bundle and smoothing models (QPs). With HiGHS, the QPs are solved by
+# Clarabel, as the HiGHS QP solver can stall on them.
+mip_optimizer() =
+    SOLVER == "gurobi" ?
+    optimizer_with_attributes(Gurobi.Optimizer, "OutputFlag" => 0, "MIPGap" => 1e-9, "Threads" => 1) :
+    optimizer_with_attributes(
+        HiGHS.Optimizer,
+        "output_flag" => false,
+        "mip_rel_gap" => 1e-9,
+        "threads" => 1,
+    )
+lp_optimizer() =
+    SOLVER == "gurobi" ?
+    optimizer_with_attributes(Gurobi.Optimizer, "OutputFlag" => 0, "Threads" => 1) :
+    optimizer_with_attributes(
+        HiGHS.Optimizer,
+        "output_flag" => false,
+        "threads" => 1,
+    )
+qp_optimizer() =
+    SOLVER == "gurobi" ?
+    optimizer_with_attributes(Gurobi.Optimizer, "OutputFlag" => 0, "Threads" => 1) :
+    optimizer_with_attributes(Clarabel.Optimizer, "verbose" => false)
 
 # Projection of the subgradient methods onto π ≥ lower
 project(oracle, π) = max.(π, oracle.lower)

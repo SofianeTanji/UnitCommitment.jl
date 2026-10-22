@@ -66,17 +66,11 @@ function main(out, name, time_limit, runs)
     reference["status"] == "optimal" || error("$name: no optimal value")
     L_star = reference["lower_bound"]
     tuned = isfile("tuned.json") ? JSON.parsefile("tuned.json") : Dict()
-    optimizer = optimizer_with_attributes(
-        HiGHS.Optimizer,
-        "output_flag" => false,
-        "mip_rel_gap" => 1e-9,
-        "threads" => 1,
-    )
     instance = UC.read(
         joinpath("instances", "$name.json.gz");
         extensions = [UC.ShiftFactorsTransmissionExt(lazy = false)],
     )
-    oracle = UC.ConvexHullOracle(instance; optimizer)
+    oracle = UC.ConvexHullOracle(instance; optimizer = mip_optimizer())
     stop = Stop(; time_limit, target = L_star - TOL * abs(L_star))
     warm = Set{String}()
     for run in runs
@@ -93,6 +87,7 @@ function main(out, name, time_limit, runs)
             "tuned_value" => value,
             "tol" => TOL,
             "threads" => Threads.nthreads(),
+            "solver" => SOLVER,
             "L_star" => L_star,
         )
         try
