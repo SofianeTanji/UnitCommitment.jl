@@ -74,6 +74,8 @@ sbatch --array=1-$(wc -l < tasks/fine.txt) bench.sh tasks/fine.txt traces/tune
 julia --project=. plan.jl select        # tuned.json, and prints the selected values
 julia --project=. plan.jl eval          # tasks/eval.txt (822 jobs of 12 runs)
 sbatch --array=1-$(wc -l < tasks/eval.txt) bench.sh tasks/eval.txt traces/eval
+# column-and-row generation, added after the evaluation (79 jobs of 1 run):
+sbatch --array=1-$(wc -l < tasks/crg.txt) bench.sh tasks/crg.txt traces/eval
 ```
 
 Each job uses 8 cores and at most 4 hours. The traces are in
