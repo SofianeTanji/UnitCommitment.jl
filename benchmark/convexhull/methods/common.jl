@@ -19,6 +19,16 @@ const SOLVER = get(ENV, "SOLVER", "highs")
 SOLVER in ("highs", "gurobi") || error("SOLVER=$SOLVER: not highs or gurobi")
 SOLVER == "gurobi" && @eval using Gurobi
 
+# With Gurobi, each environment holds a connection to the license server, so
+# all the models share Threads.nthreads() environments, created once: block b
+# of the oracle uses environment env_slot(b, K) (see use_gurobi_envs!), and the
+# models of the methods, solved between evaluations, use the first one. An
+# environment must not be used by two threads at once, so evaluate! solves the
+# blocks of an environment one after the other, in one task.
+const GUROBI_ENVS =
+    SOLVER == "gurobi" ? [Gurobi.Env(; output_flag = 0) for _ in 1:Threads.nthreads()] : []
+env_slot(b, K) = mod1(b, K)
+
 # Stops after `time_limit` seconds, or once the certified value of L(π) is at
 # least `target`
 Base.@kwdef struct Stop
@@ -69,12 +79,23 @@ function evaluate!(
 )
     start = time()
     blocks = Vector{Any}(undef, length(oracle.blocks))
-    Threads.@threads :greedy for b in eachindex(oracle.blocks)
+    function solve(b)
         model = oracle.blocks[b].model
         set_attribute(model, MOI.RelativeGapTolerance(), gap)
         r = UC.solve_block!(oracle, b, π)
         cost = isfinite(r.value) ? value(oracle.blocks[b].cost) : NaN
         blocks[b] = (; r..., cost)
+        return
+    end
+    if SOLVER == "gurobi"
+        K = length(GUROBI_ENVS)
+        @sync for k in 1:K
+            Threads.@spawn foreach(solve, k:K:length(oracle.blocks))
+        end
+    else
+        Threads.@threads :greedy for b in eachindex(oracle.blocks)
+            solve(b)
+        end
     end
     timed || (trace.start += time() - start)
     L = sum(r.value for r in blocks)
@@ -107,9 +128,14 @@ end
 # default), of the column generation masters (LPs, with duals) and of the
 # bundle and smoothing models (QPs). With HiGHS, the QPs are solved by
 # Clarabel, as the HiGHS QP solver can stall on them.
-mip_optimizer() =
+mip_optimizer(env = 1) =
     SOLVER == "gurobi" ?
-    optimizer_with_attributes(Gurobi.Optimizer, "OutputFlag" => 0, "MIPGap" => 1e-9, "Threads" => 1) :
+    optimizer_with_attributes(
+        () -> Gurobi.Optimizer(GUROBI_ENVS[env]),
+        "OutputFlag" => 0,
+        "MIPGap" => 1e-9,
+        "Threads" => 1,
+    ) :
     optimizer_with_attributes(
         HiGHS.Optimizer,
         "output_flag" => false,
@@ -118,7 +144,7 @@ mip_optimizer() =
     )
 lp_optimizer() =
     SOLVER == "gurobi" ?
-    optimizer_with_attributes(Gurobi.Optimizer, "OutputFlag" => 0, "Threads" => 1) :
+    optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENVS[1]), "OutputFlag" => 0, "Threads" => 1) :
     optimizer_with_attributes(
         HiGHS.Optimizer,
         "output_flag" => false,
@@ -126,8 +152,20 @@ lp_optimizer() =
     )
 qp_optimizer() =
     SOLVER == "gurobi" ?
-    optimizer_with_attributes(Gurobi.Optimizer, "OutputFlag" => 0, "Threads" => 1) :
+    optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENVS[1]), "OutputFlag" => 0, "Threads" => 1) :
     optimizer_with_attributes(Clarabel.Optimizer, "verbose" => false)
+
+# Moves block b of the oracle (built with mip_optimizer()) to its Gurobi
+# environment
+function use_gurobi_envs!(oracle)
+    SOLVER == "gurobi" || return oracle
+    K = length(GUROBI_ENVS)
+    for (b, blk) in enumerate(oracle.blocks)
+        set_optimizer(blk.model, mip_optimizer(env_slot(b, K)))
+        set_silent(blk.model)
+    end
+    return oracle
+end
 
 # Projection of the subgradient methods onto π ≥ lower
 project(oracle, π) = max.(π, oracle.lower)

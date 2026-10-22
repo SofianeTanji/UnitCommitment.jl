@@ -70,7 +70,7 @@ function main(out, name, time_limit, runs)
         joinpath("instances", "$name.json.gz");
         extensions = [UC.ShiftFactorsTransmissionExt(lazy = false)],
     )
-    oracle = UC.ConvexHullOracle(instance; optimizer = mip_optimizer())
+    oracle = use_gurobi_envs!(UC.ConvexHullOracle(instance; optimizer = mip_optimizer()))
     stop = Stop(; time_limit, target = L_star - TOL * abs(L_star))
     warm = Set{String}()
     for run in runs
