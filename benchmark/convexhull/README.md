@@ -51,7 +51,7 @@ julia --project=. collect.jl
 
 `methods/` holds the methods that maximize `L` (subgradient, bundle, smoothing
 and column generation), with the interface described in `methods/common.jl`.
-`configs.jl` lists the 69 benchmarked configurations, each with at most one
+`configs.jl` lists the 70 benchmarked configurations, each with at most one
 tuned parameter, and the tuning instances: one per dataset (or-lib,
 pglib-uc/ca and pglib-uc/ferc), the one with the median gap
 `(L* - L(π0)) / |L*|`. The other instances on which `L(π0)` is not within

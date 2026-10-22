@@ -66,6 +66,7 @@ const CONFIGS = [
     Config("cg-single", "cg", (; multicut = false)),
     Config("cg-multicut", "cg", (; multicut = true)),
     Config("cg-stabilized", "cg", (; multicut = true); tuned = :α, grid = :lin, range = (0.1, 0.9)),
+    Config("crg", "crg", (;)),
 ]
 
 const CONFIG = Dict(c.label => c for c in CONFIGS)

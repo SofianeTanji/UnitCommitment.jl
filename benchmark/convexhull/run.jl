@@ -19,6 +19,7 @@ include("methods/subgradient.jl")
 include("methods/smoothing.jl")
 include("methods/bundle.jl")
 include("methods/primal.jl")
+include("methods/crg.jl")
 include("configs.jl")
 
 const METHODS = Dict(
@@ -32,6 +33,7 @@ const METHODS = Dict(
     "bplm" => bplm,
     "bpm" => bpm,
     "cg" => cg,
+    "crg" => crg,
 )
 
 const TOL = 1e-6
@@ -96,6 +98,7 @@ function main(out, name, time_limit, runs)
         try
             p = parameters(c, value, oracle, reference, time_limit)
             result["parameters"] = Dict(string(k) => v for (k, v) in p)
+            c.method == "crg" && (p[:instance] = instance)
             if !(c.method in warm)
                 method(oracle, oracle.π0, Stop(; time_limit = WARMUP); p...)
                 push!(warm, c.method)
