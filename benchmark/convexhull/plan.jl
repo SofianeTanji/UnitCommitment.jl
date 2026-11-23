@@ -32,7 +32,9 @@
 # 300 s without one.
 # The step prints, for a budget of TOKENS tokens (60 by default, environment
 # variable), the caps %M of the two job arrays that use at most TOKENS tokens
-# at a time and minimize the estimated makespan max(job-hours / cap).
+# and run at most MAX_JOBS jobs at a time (48 by default: the CPU limit per
+# user of NIC6, 384 cores, is 48 jobs of 8 cores), and minimize the estimated
+# makespan max(job-hours / cap).
 #
 # The best value is the one with the smallest final relative gap
 # (L* - best bound) / |L*|, counting gaps below 1e-6 as 1e-6, and then the
@@ -74,6 +76,7 @@ tuned_configs() = filter(c -> c.tuned !== nothing, SELECTED)
 
 const THREADS = 8                      # cpus-per-task of bench.sh
 const TOKENS = parse(Int, get(ENV, "TOKENS", "60"))
+const MAX_JOBS = parse(Int, get(ENV, "MAX_JOBS", "48"))
 
 label_of(run) = String(split(run, '@')[1])
 is_mip(line) = any(r -> CONFIG[label_of(r)].method == "fgm_ch", split(line)[2:end])
@@ -115,7 +118,7 @@ function write_tasks(file, lines)
     h1, h2 = get(hours, f1, 0.0), get(hours, f2, 0.0)
     best = (Inf, 0, 0)
     for m in (h2 > 0 ? (1:TOKENS÷THREADS) : 0:0)
-        c = h1 > 0 ? TOKENS - THREADS * m : 0
+        c = h1 > 0 ? min(TOKENS - THREADS * m, MAX_JOBS - m) : 0
         c < (h1 > 0) && continue
         makespan = max(h1 > 0 ? h1 / c : 0.0, h2 > 0 ? h2 / m : 0.0)
         makespan < best[1] && (best = (makespan, c, m))
@@ -123,7 +126,7 @@ function write_tasks(file, lines)
     makespan, c, m = best
     h1 > 0 && println("  sbatch --array=1-$(countlines(f1))%$c bench.sh $f1 ...   (1 token per job)")
     h2 > 0 && println("  sbatch --array=1-$(countlines(f2))%$m bench.sh $f2 ...   ($THREADS tokens per job)")
-    println("  estimated makespan $(round(makespan; digits = 1)) h with $TOKENS tokens")
+    println("  estimated makespan $(round(makespan; digits = 1)) h with $TOKENS tokens and $MAX_JOBS jobs")
 end
 
 function main(step)

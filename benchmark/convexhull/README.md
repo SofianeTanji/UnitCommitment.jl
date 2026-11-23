@@ -91,9 +91,11 @@ MILPs need one environment per thread (8 tokens). `plan.jl` therefore writes
 the jobs of `fgm_ch` in a separate file (`*_mip.txt`), sorts each file by
 decreasing estimated time (the longest first), and prints the caps `%M` of the
 two arrays that stay within 60 tokens (`TOKENS=<n>` for another budget) and
-minimize the estimated makespan, with both arrays running at the same time.
-When the `*_mip.txt` array is done, its tokens can go to the other one:
-`scontrol update JobId=<array job id> ArrayTaskThrottle=60`.
+48 jobs (`MAX_JOBS`: the CPU limit per user of NIC6, 384 cores; beyond it, the
+jobs wait with the reason `QOSMaxCpuPerUserLimit`), and minimize the
+estimated makespan, with both arrays running at the same time. When the
+`*_mip.txt` array is done, its slots can go to the other one:
+`scontrol update JobId=<array job id> ArrayTaskThrottle=48`.
 
 A regex after the step restricts it to the matching labels, with task files
 suffixed accordingly; `select` then only updates their entries of
