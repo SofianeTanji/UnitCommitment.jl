@@ -168,11 +168,16 @@ end
 inexact_gap(inexact, max_gap, Δ, L_best) =
     inexact > 0 ? clamp(inexact * Δ / abs(L_best), 1e-9, max_gap) : 1e-9
 
-# BLM and BPLM. The level is ℓ = U - α (U - L_best), where U is the maximum of
-# the model; the next price is the projection of the center onto
-# {π : model(π) ≥ ℓ}. For BLM the center is the last price. For BPLM it is the
-# best price, and the level is only lowered once the gap U - L_best has
-# decreased by the factor 1 - α. With `trust_region`, U in the level is the
+# BLM and BPLM. The next price is the projection of the center onto
+# {π : model(π) ≥ ℓ}, where U is the maximum of the model. For BLM the center
+# is the last price and ℓ = U - α (U - L_best). For BPLM the center is the best
+# price and ℓ = L_best + β (U - L_best), with a variable β: 1 - α at the
+# start, halved after each evaluation that does not improve L_best, doubled
+# (up to 1 - α) after each one that does. With a fixed α, U - L_best
+# overestimates the gap by a factor of about 2000 at the start (one cut, the
+# whole price box) and the level is out of reach for many evaluations (17 on
+# pglib-uc/ca/2015-06-01_reserves_1, 6 with the variable β); near the end, a
+# small β would give tiny steps. With `trust_region`, U in the level is the
 # maximum of the model over the trust region (a local bound, never recorded in
 # the trace); while it is not above L_best, all the radii are doubled.
 function level_method(
@@ -192,7 +197,7 @@ function level_method(
     P = Preconditioner(precondition, length(π0))
     R = TrustRegion(trust_region, length(π0))
     B, π, gap = nothing, π0, 1e-9
-    level, Δ_ref = -Inf, Inf
+    β = 1 - α
     level_con, center = nothing, nothing
     while true
         L_prev = maximum(trace.bound; init = -Inf)
@@ -202,8 +207,8 @@ function level_method(
         add_cuts!(B, r)
         w = update!(P, r.grad)
         L_best = maximum(trace.bound)
+        proximal && (β = r.bound > L_prev ? min(2β, 1 - α) : β / 2)
         R.on && center !== nothing && update!(R, B, center, π, r.bound > L_prev)
-        level_con === nothing || delete(B.model, level_con)
         R.on && set_region!(B, B.lo, B.hi)
         U = model_max!(B)
         trace.U = min(trace.U, U)
@@ -222,13 +227,16 @@ function level_method(
             R.δ .*= 2
         end
         Δ_k = U_k - L_best
-        new_level = U_k - α * Δ_k
-        if !proximal || Δ_k < (1 - α) * Δ_ref
-            level, Δ_ref = new_level, Δ_k
+        level = proximal ? L_best + β * Δ_k : U_k - α * Δ_k
+        # the level constraint is kept and only its right-hand side changes:
+        # deleting and re-adding it loses the basis of the dual simplex (on
+        # pglib-uc/ca/2015-06-01_reserves_1 with one model per block, 967
+        # instead of 95 simplex iterations per projection, 3.2 times longer)
+        if level_con === nothing
+            level_con = @constraint(B.model, sum(B.θ) >= level)
         else
-            level = min(max(level, new_level), U_k)
+            set_normalized_rhs(level_con, level)
         end
-        level_con = @constraint(B.model, sum(B.θ) >= level)
         @objective(
             B.model,
             Min,
