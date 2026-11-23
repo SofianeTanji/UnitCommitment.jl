@@ -13,7 +13,7 @@
 # <output dir>/<run>/<name>.json. A run that fails is recorded with status
 # "error" and the next runs go on.
 
-using UnitCommitment, HiGHS, JSON
+using UnitCommitment, JSON
 include("methods/common.jl")
 include("methods/subgradient.jl")
 include("methods/smoothing.jl")
@@ -71,6 +71,7 @@ function main(out, name, time_limit, runs)
         extensions = [UC.ShiftFactorsTransmissionExt(lazy = false)],
     )
     oracle = use_gurobi_envs!(UC.ConvexHullOracle(instance; optimizer = mip_optimizer()))
+    n_dp = ORACLE == "dp" ? enable_dp!(oracle, instance) : 0
     stop = Stop(; time_limit, target = L_star - TOL * abs(L_star))
     warm = Set{String}()
     for run in runs
@@ -87,7 +88,9 @@ function main(out, name, time_limit, runs)
             "tuned_value" => value,
             "tol" => TOL,
             "threads" => Threads.nthreads(),
-            "solver" => SOLVER,
+            "solver" => "gurobi",
+            "oracle" => ORACLE,
+            "dp_blocks" => n_dp,
             "L_star" => L_star,
         )
         try
@@ -98,7 +101,10 @@ function main(out, name, time_limit, runs)
                 method(oracle, oracle.π0, Stop(; time_limit = WARMUP); p...)
                 push!(warm, c.method)
             end
+            DP_CALLS[], DP_RAMP[], DP_FALLBACKS[] = 0, 0, 0
             trace = method(oracle, oracle.π0, stop; p...)
+            result["dp_calls"], result["dp_ramp"], result["dp_fallbacks"] =
+                DP_CALLS[], DP_RAMP[], DP_FALLBACKS[]
             merge!(
                 result,
                 Dict(

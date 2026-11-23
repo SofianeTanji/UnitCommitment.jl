@@ -8,6 +8,9 @@
 # - `precondition`: the quadratic terms use the weights w_j = clamp((rms_j +
 #   1e-8)^-2, 1e-4, 1e4), where rms is an exponential moving average (factor
 #   0.9) of the squared supergradients.
+# - `trust_region` (BLM and BPLM): the projection and the level are computed
+#   on a trust region around the center instead of the whole box, with one
+#   radius per coupling row (see TrustRegion).
 # - `inexact`: if positive, the MIP blocks of the next evaluation are solved
 #   with the relative gap clamp(inexact · Δ / |L_best|, 1e-9, max_gap), where
 #   Δ is the current gap estimate of the method. The cuts remain valid (they
@@ -18,16 +21,42 @@
 #     L_b(π) ≤ cost_b(x_b) - π' a_b,   a_b = g_b(x_b),
 #
 # and the model of a cluster is the minimum of the cuts of its blocks, summed.
+#
+# With Gurobi, the masters are solved by the dual simplex (Method = 1),
+# warm-started from their last basis, instead of the default barrier, which
+# restarts from scratch at each solve (with one model per block, the master
+# is large: a cut per block per iteration). The LP of the maximum of the
+# model and the QP of the projection are two models with the same cuts, so
+# that each one is warm-started from its own last solve: warm-started from
+# the LP basis, the simplex of Gurobi fails on the QP (dual infeasible or
+# numerical error). A solve that fails is redone with the default method.
 
 struct Bundle
     model::Model
     π::Vector{VariableRef}
     θ::Vector{VariableRef}
     members::Vector{Vector{Int}}
+    lo::Vector{Float64}
+    hi::Vector{Float64}
+    lp::Model                          # LP of model_max! (B.model without it)
+    lpπ::Vector{VariableRef}
+    lpθ::Vector{VariableRef}
+end
+
+# Solves m (B.model or B.lp), again with the default method if it fails
+function solve_master!(m)
+    set_attribute(m, "Method", 1)
+    optimize!(m)
+    if termination_status(m) != MOI.OPTIMAL
+        set_attribute(m, "Method", -1)
+        optimize!(m)
+    end
+    return
 end
 
 # Model over the box, with the clusters set from the first evaluation `r`
-function Bundle(oracle, r, cuts; radius)
+# (with `lp`, a second model for model_max!)
+function Bundle(oracle, r, cuts; radius, lp = true)
     lo, hi = price_box(oracle; radius)
     model = Model(qp_optimizer())
     set_silent(model)
@@ -44,7 +73,14 @@ function Bundle(oracle, r, cuts; radius)
     end
     members = filter(!isempty, [findall(==(k), cluster) for k in 1:K])
     θ = @variable(model, [eachindex(members)])
-    return Bundle(model, π, θ, members)
+    lp_model, lpπ, lpθ = model, π, θ
+    if lp
+        lp_model = Model(qp_optimizer())
+        set_silent(lp_model)
+        lpπ = @variable(lp_model, lo[j] <= lpπ[j = eachindex(lo)] <= hi[j])
+        lpθ = @variable(lp_model, [eachindex(members)])
+    end
+    return Bundle(model, π, θ, members, lo, hi, lp_model, lpπ, lpθ)
 end
 
 function add_cuts!(B::Bundle, r)
@@ -54,19 +90,63 @@ function add_cuts!(B::Bundle, r)
             c += r.blocks[b].cost
             a += r.blocks[b].a
         end
-        @constraint(
-            B.model,
-            B.θ[k] + sum(v * B.π[j] for (j, v) in zip(findnz(a)...); init = 0) <= c
-        )
+        for (m, π, θ) in unique([(B.model, B.π, B.θ), (B.lp, B.lpπ, B.lpθ)])
+            @constraint(m, θ[k] + sum(v * π[j] for (j, v) in zip(findnz(a)...); init = 0) <= c)
+        end
     end
     return
 end
 
 # Maximum of the model over the box, an upper bound on max L
 function model_max!(B::Bundle)
-    @objective(B.model, Max, sum(B.θ))
-    optimize!(B.model)
-    return objective_value(B.model)
+    @objective(B.lp, Max, sum(B.lpθ))
+    solve_master!(B.lp)
+    return objective_value(B.lp)
+end
+
+function set_region!(B::Bundle, lo, hi)
+    for π in unique([B.π, B.lpπ]), j in eachindex(π)
+        set_lower_bound(π[j], lo[j])
+        set_upper_bound(π[j], hi[j])
+    end
+    return
+end
+
+# Trust region of the variable-metric level methods of the thesis (PC-BLM,
+# PC-BPLM), with one radius δ_j per coupling row j: X = {π in the box :
+# |π_j - c_j| ≤ δ_j} around the center c. The first step is over the whole box
+# and sets every δ_j to its ∞-norm. After each step from c to π, a row is at
+# the boundary if |π_j - c_j| ≥ 0.9 δ_j and the box does not cut the region
+# in that direction. If the step improved L_best, δ_j doubles at the boundary
+# and the counters are reset; otherwise the counter n_j of a row at the
+# boundary is incremented, and δ_j is halved when it reaches 3.
+mutable struct TrustRegion
+    on::Bool
+    δ::Vector{Float64}
+    n::Vector{Int}
+end
+
+TrustRegion(on, n) = TrustRegion(on, fill(Inf, n), zeros(Int, n))
+
+region(R::TrustRegion, B::Bundle, c) = max.(B.lo, c .- R.δ), min.(B.hi, c .+ R.δ)
+
+function update!(R::TrustRegion, B::Bundle, c, π, improved)
+    if all(isinf, R.δ)
+        R.δ .= max(maximum(abs.(π .- c)), 1e-9 * (1 + maximum(abs, c)))
+        return R
+    end
+    for j in eachindex(π)
+        edge = π[j] >= c[j] ? B.hi[j] - c[j] : c[j] - B.lo[j]
+        abs(π[j] - c[j]) >= 0.9 * R.δ[j] && R.δ[j] < edge || continue
+        if improved
+            R.δ[j] *= 2
+        else
+            R.n[j] += 1
+            R.n[j] == 3 && (R.δ[j] /= 2; R.n[j] = 0)
+        end
+    end
+    improved && fill!(R.n, 0)
+    return R
 end
 
 # Weights of the quadratic terms
@@ -92,7 +172,9 @@ inexact_gap(inexact, max_gap, Δ, L_best) =
 # the model; the next price is the projection of the center onto
 # {π : model(π) ≥ ℓ}. For BLM the center is the last price. For BPLM it is the
 # best price, and the level is only lowered once the gap U - L_best has
-# decreased by the factor 1 - α.
+# decreased by the factor 1 - α. With `trust_region`, U in the level is the
+# maximum of the model over the trust region (a local bound, never recorded in
+# the trace); while it is not above L_best, all the radii are doubled.
 function level_method(
     oracle,
     π0,
@@ -104,20 +186,25 @@ function level_method(
     inexact = 0.0,
     max_gap = 1e-2,
     radius = 1.0,
+    trust_region = false,
 )
     trace = Trace(π0)
     P = Preconditioner(precondition, length(π0))
+    R = TrustRegion(trust_region, length(π0))
     B, π, gap = nothing, π0, 1e-9
     level, Δ_ref = -Inf, Inf
-    level_con = nothing
+    level_con, center = nothing, nothing
     while true
+        L_prev = maximum(trace.bound; init = -Inf)
         r = evaluate!(trace, oracle, π, stop; gap)
         r.stop && break
         B === nothing && (B = Bundle(oracle, r, cuts; radius))
         add_cuts!(B, r)
         w = update!(P, r.grad)
         L_best = maximum(trace.bound)
+        R.on && center !== nothing && update!(R, B, center, π, r.bound > L_prev)
         level_con === nothing || delete(B.model, level_con)
+        R.on && set_region!(B, B.lo, B.hi)
         U = model_max!(B)
         trace.U = min(trace.U, U)
         Δ = U - L_best
@@ -125,20 +212,29 @@ function level_method(
             trace.status = "optimal"
             break
         end
-        new_level = U - α * Δ
-        if !proximal || Δ < (1 - α) * Δ_ref
-            level, Δ_ref = new_level, Δ
-        else
-            level = min(max(level, new_level), U)
-        end
         center = proximal ? trace.best_π : π
+        U_k = U
+        while R.on
+            lo, hi = region(R, B, center)
+            set_region!(B, lo, hi)
+            U_k = model_max!(B)
+            (U_k - L_best > 1e-12 * abs(L_best) || (lo == B.lo && hi == B.hi)) && break
+            R.δ .*= 2
+        end
+        Δ_k = U_k - L_best
+        new_level = U_k - α * Δ_k
+        if !proximal || Δ_k < (1 - α) * Δ_ref
+            level, Δ_ref = new_level, Δ_k
+        else
+            level = min(max(level, new_level), U_k)
+        end
         level_con = @constraint(B.model, sum(B.θ) >= level)
         @objective(
             B.model,
             Min,
             0.5 * sum(w[j] * (B.π[j] - center[j])^2 for j in eachindex(center))
         )
-        optimize!(B.model)
+        solve_master!(B.model)
         is_solved_and_feasible(B.model) && (π = value.(B.π))
         gap = inexact_gap(inexact, max_gap, Δ, L_best)
     end
@@ -182,7 +278,7 @@ function bpm(
     P = Preconditioner(precondition, length(π0))
     r = evaluate!(trace, oracle, π0, stop)
     r.stop && return trace
-    B = Bundle(oracle, r, cuts; radius)
+    B = Bundle(oracle, r, cuts; radius, lp = false)
     add_cuts!(B, r)
     w = copy(update!(P, r.grad))
     t = Float64(t)
@@ -198,7 +294,7 @@ function bpm(
             sum(B.θ) -
             sum(w[j] * (B.π[j] - y[j])^2 for j in eachindex(y)) / (2 * t)
         )
-        optimize!(B.model)
+        solve_master!(B.model)
         π, model_π = value.(B.π), value(sum(B.θ))
         r = evaluate!(trace, oracle, π, stop; gap)
         r.stop && break

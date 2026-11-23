@@ -15,25 +15,28 @@
 # parallel (julia -t <threads>). The prices with the best lower bound are the
 # convex hull prices.
 #
-# Usage: julia -t <threads> --project=. dw.jl <name> <instances dir> <results dir> <time limit (s)>
-# Reads <instances dir>/<name>.json.gz and writes <results dir>/<name>.json.
+# The blocks and the master are solved by Gurobi (see methods/common.jl), with
+# one environment per thread. With a warm start file (the result of an
+# earlier run), the blocks are also priced at its convex hull prices before
+# the first master, and these prices are the first center if they give a
+# better bound than the LP duals; only the prices are reused, and all the
+# bounds are recomputed.
+#
+# Usage: julia -t <threads> --project=. dw.jl <name> <instances dir> <results dir> <time limit (s)> [<tol> [<warm start dir>]]
+# Reads <instances dir>/<name>.json.gz (and <warm start dir>/<name>.json) and
+# writes <results dir>/<name>.json. Stops at the relative gap <tol> (default
+# 1e-6).
 
-using UnitCommitment, HiGHS, JuMP, JSON, SparseArrays
-const UC = UnitCommitment
+using UnitCommitment, JuMP, JSON, SparseArrays
+include("methods/common.jl")
 
-function dw(path; time_limit, tol = 1e-6, α = 0.5)
+function dw(path; time_limit, tol = 1e-6, α = 0.5, warm = nothing)
     start = time()
-    optimizer = optimizer_with_attributes(
-        HiGHS.Optimizer,
-        "output_flag" => false,
-        "mip_rel_gap" => 1e-9,
-        "threads" => 1,
-    )
     instance = UC.read(
         path;
         extensions = [UC.ShiftFactorsTransmissionExt(lazy = false)],
     )
-    oracle = UC.ConvexHullOracle(instance; optimizer)
+    oracle = use_gurobi_envs!(UC.ConvexHullOracle(instance; optimizer = mip_optimizer()))
     build_time = time() - start
     n = length(oracle.keys)
     blocks = oracle.blocks
@@ -45,9 +48,14 @@ function dw(path; time_limit, tol = 1e-6, α = 0.5)
     # bound on L(π)
     function price(π)
         results = Vector{Any}(undef, length(blocks))
-        Threads.@threads :greedy for b in eachindex(blocks)
+        function solve(b)
             r = UC.solve_block!(oracle, b, π)
             results[b] = (; r..., cost = value(blocks[b].cost))
+            return
+        end
+        K = length(GUROBI_ENVS) # one task per environment, see methods/common.jl
+        @sync for k in 1:K
+            Threads.@spawn foreach(solve, k:K:length(blocks))
         end
         return results, sum(r.bound for r in results)
     end
@@ -60,7 +68,7 @@ function dw(path; time_limit, tol = 1e-6, α = 0.5)
             unregister(sys.model, name)
     end
     master, ref = copy_model(sys.model)
-    set_optimizer(master, optimizer)
+    set_optimizer(master, lp_optimizer())
     M = 1e3 * (1 + maximum(abs, oracle.π0))
     s_plus = @variable(master, [1:n], lower_bound = 0)
     s_minus = @variable(master, [1:n], lower_bound = 0)
@@ -104,6 +112,14 @@ function dw(path; time_limit, tol = 1e-6, α = 0.5)
     L0 = lower
     center = oracle.π0
     add_columns!(results, nothing, nothing)
+    warm_bound = nothing
+    if warm !== nothing
+        string.(oracle.keys) == warm["keys"] || error("warm start: other coupling rows")
+        π_warm = Float64.(warm["convex_hull_prices"])
+        results, warm_bound = price(π_warm)
+        add_columns!(results, nothing, nothing)
+        warm_bound > lower && ((lower, center) = (warm_bound, π_warm))
+    end
 
     status = "time_limit"
     upper, gap, iterations, pricings, artificials = Inf, Inf, 0, 1, NaN
@@ -148,6 +164,9 @@ function dw(path; time_limit, tol = 1e-6, α = 0.5)
         "units" => length(units),
         "prices" => n,
         "threads" => Threads.nthreads(),
+        "solver" => "gurobi",
+        "tol" => tol,
+        "warm_start_bound" => warm_bound,
         "build_time" => build_time,
         "total_time" => time() - start,
         "keys" => [string(k) for k in oracle.keys],
@@ -157,11 +176,14 @@ function dw(path; time_limit, tol = 1e-6, α = 0.5)
     )
 end
 
-function main(name, instances_dir, results_dir, time_limit)
+function main(name, instances_dir, results_dir, time_limit, tol = 1e-6, warm_dir = nothing)
     out = joinpath(results_dir, "$name.json")
     mkpath(dirname(out))
+    warm_file = warm_dir === nothing ? nothing : joinpath(warm_dir, "$name.json")
+    warm = warm_file !== nothing && isfile(warm_file) ? JSON.parsefile(warm_file) : nothing
+    warm !== nothing && get(warm, "status", "") == "error" && (warm = nothing)
     result = try
-        dw(joinpath(instances_dir, "$name.json.gz"); time_limit)
+        dw(joinpath(instances_dir, "$name.json.gz"); time_limit, tol, warm)
     catch e
         Dict("status" => "error", "error" => sprint(showerror, e))
     end
@@ -170,4 +192,4 @@ function main(name, instances_dir, results_dir, time_limit)
     return
 end
 
-main(ARGS[1], ARGS[2], ARGS[3], parse(Float64, ARGS[4]))
+main(ARGS[1:3]..., parse.(Float64, ARGS[4:min(end, 5)])..., ARGS[6:end]...)

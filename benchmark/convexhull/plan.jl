@@ -2,7 +2,8 @@
 # a task file is the instance and the runs of one job of bench.sh (see
 # run.jl).
 #
-# Usage: julia --project=. plan.jl <step>, with the steps in this order:
+# Usage: julia --project=. plan.jl <step> [<label regex>], with the steps in
+# this order:
 #
 #   coarse  tasks/coarse.txt: the coarse grid of every tuned configuration, on
 #           each tuning instance
@@ -13,6 +14,25 @@
 #           instance of each dataset, from all the traces in traces/tune
 #   eval    tasks/eval.txt: every configuration on each benchmark instance
 #           that is not a tuning instance, 12 runs per job
+#
+# With a regex, each step only covers the configurations whose label matches
+# it (e.g. '-tr' for the trust region variants): the task files get the
+# suffix _<letters and digits of the regex> (tasks/coarse_tr.txt), and select
+# updates their entries of tuned.json, keeping the others.
+#
+# Gurobi tokens: the jobs of fgm_ch, whose pricing MILPs are not solved by the
+# dynamic program, use one Gurobi environment (license token) per thread,
+# THREADS; the other jobs use one (see methods/common.jl and bench.sh). Each
+# task file is therefore split: <file>.txt for the jobs with one token and
+# <file>_mip.txt for those of fgm_ch. Within a file, the jobs are sorted by
+# decreasing estimated time (the longest first, which shortens the makespan
+# when the number of running jobs is capped): the build time of the oracle,
+# 20 s of warm-up per method, and for each run its time in the earlier traces
+# (traces/*/ or traces_old/*/<run or label>/<name>.json), at most 300 s, or
+# 300 s without one.
+# The step prints, for a budget of TOKENS tokens (60 by default, environment
+# variable), the caps %M of the two job arrays that use at most TOKENS tokens
+# at a time and minimize the estimated makespan max(job-hours / cap).
 #
 # The best value is the one with the smallest final relative gap
 # (L* - best bound) / |L*|, counting gaps below 1e-6 as 1e-6, and then the
@@ -46,12 +66,64 @@ end
 
 best_value(c, name) = argmin(last, tuning_runs(c, name))[1]
 
-tuned_configs() = filter(c -> c.tuned !== nothing, CONFIGS)
+const SELECTED = length(ARGS) >= 2 ? filter(c -> occursin(Regex(ARGS[2]), c.label), CONFIGS) : CONFIGS
+
+const SUFFIX = length(ARGS) >= 2 ? "_" * replace(ARGS[2], r"[^A-Za-z0-9]" => "") : ""
+
+tuned_configs() = filter(c -> c.tuned !== nothing, SELECTED)
+
+const THREADS = 8                      # cpus-per-task of bench.sh
+const TOKENS = parse(Int, get(ENV, "TOKENS", "60"))
+
+label_of(run) = String(split(run, '@')[1])
+is_mip(line) = any(r -> CONFIG[label_of(r)].method == "fgm_ch", split(line)[2:end])
+
+# Time of a run in the earlier traces, at most 300 s
+function trace_time(name, run)
+    for root in ("traces", "traces_old"), stage in ("eval_gurobi", "eval", "tune"),
+        dir in unique([run, label_of(run)])
+        file = joinpath(root, stage, dir, "$name.json")
+        isfile(file) || continue
+        t = try JSON.parsefile(file)["time"] catch; nothing end
+        t isa Vector && !isempty(t) && return min(Float64(t[end]), 300.0)
+    end
+    return 300.0
+end
+
+function estimate(line)
+    name, runs = split(line)[1], split(line)[2:end]
+    file = joinpath("results", "$name.json")
+    build = isfile(file) ? Float64(get(JSON.parsefile(file), "build_time", 60.0)) : 60.0
+    methods = unique(CONFIG[label_of(r)].method for r in runs)
+    return build + 20 * length(methods) + sum(r -> trace_time(name, r), runs)
+end
 
 function write_tasks(file, lines)
     mkpath(dirname(file))
-    open(io -> foreach(l -> println(io, l), lines), file, "w")
-    println("$file: $(length(lines)) jobs")
+    files = [(file, filter(!is_mip, lines), 1), (replace(file, ".txt" => "_mip.txt"), filter(is_mip, lines), THREADS)]
+    hours = Dict{String,Float64}()
+    for (f, ls, _) in files
+        isempty(ls) && continue
+        t = estimate.(ls)
+        order = sortperm(t; rev = true)
+        open(io -> foreach(l -> println(io, l), ls[order]), f, "w")
+        hours[f] = sum(t) / 3600
+        println("$f: $(length(ls)) jobs, estimated $(round(hours[f]; digits = 1)) job-hours")
+    end
+    # caps (one-token jobs, MIP jobs) within the budget, with the least makespan
+    (f1, _, _), (f2, _, _) = files
+    h1, h2 = get(hours, f1, 0.0), get(hours, f2, 0.0)
+    best = (Inf, 0, 0)
+    for m in (h2 > 0 ? (1:TOKENS÷THREADS) : 0:0)
+        c = h1 > 0 ? TOKENS - THREADS * m : 0
+        c < (h1 > 0) && continue
+        makespan = max(h1 > 0 ? h1 / c : 0.0, h2 > 0 ? h2 / m : 0.0)
+        makespan < best[1] && (best = (makespan, c, m))
+    end
+    makespan, c, m = best
+    h1 > 0 && println("  sbatch --array=1-$(countlines(f1))%$c bench.sh $f1 ...   (1 token per job)")
+    h2 > 0 && println("  sbatch --array=1-$(countlines(f2))%$m bench.sh $f2 ...   ($THREADS tokens per job)")
+    println("  estimated makespan $(round(makespan; digits = 1)) h with $TOKENS tokens")
 end
 
 function main(step)
@@ -60,7 +132,7 @@ function main(step)
             join([name; ["$(c.label)@$v" for v in coarse_grid(c)]], " ") for
             name in TUNING for c in tuned_configs()
         ]
-        write_tasks("tasks/coarse.txt", lines)
+        write_tasks("tasks/coarse$SUFFIX.txt", lines)
     elseif step == "fine"
         lines = String[]
         for name in TUNING, c in tuned_configs()
@@ -72,12 +144,13 @@ function main(step)
             runs = ["$(c.label)@$v" for v in fine_grid(c, best_value(c, name))]
             isempty(runs) || push!(lines, join([name; runs], " "))
         end
-        write_tasks("tasks/fine.txt", lines)
+        write_tasks("tasks/fine$SUFFIX.txt", lines)
     elseif step == "select"
-        tuned = Dict(
-            dataset(name) => Dict(c.label => best_value(c, name) for c in tuned_configs()) for
-            name in TUNING
-        )
+        tuned = length(ARGS) >= 2 && isfile("tuned.json") ? JSON.parsefile("tuned.json") : Dict()
+        for name in TUNING
+            entries = get!(tuned, dataset(name), Dict())
+            merge!(entries, Dict(c.label => best_value(c, name) for c in tuned_configs()))
+        end
         open(io -> JSON.print(io, tuned, 2), "tuned.json", "w")
         for name in TUNING, c in tuned_configs()
             v = best_value(c, name)
@@ -87,13 +160,14 @@ function main(step)
         end
     elseif step == "eval"
         names = setdiff(benchmark_instances(; tol = TOL), TUNING)
-        labels = [c.label for c in CONFIGS]
+        labels = [c.label for c in SELECTED]
+        mip = filter(l -> CONFIG[l].method == "fgm_ch", labels)
         lines = [
             join([name; chunk], " ") for name in names for
-            chunk in Iterators.partition(labels, 12)
+            group in (setdiff(labels, mip), mip) for chunk in Iterators.partition(group, 12)
         ]
         println("$(length(names)) instances, $(length(labels)) configurations")
-        write_tasks("tasks/eval.txt", lines)
+        write_tasks("tasks/eval$SUFFIX.txt", lines)
     else
         error("unknown step $step")
     end

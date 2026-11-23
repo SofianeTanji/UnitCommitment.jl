@@ -9,24 +9,27 @@
 # through `evaluate!(trace, oracle, π, stop)`, which records the evaluation in
 # the trace, and it returns as soon as that call sets `stop`.
 
-using UnitCommitment, Clarabel, HiGHS, JuMP, LinearAlgebra, SparseArrays
+using UnitCommitment, Gurobi, JuMP, LinearAlgebra, SparseArrays
 const UC = UnitCommitment
 
-# Solver of the oracle MIPs and of the models of the methods, from the
-# environment variable SOLVER: "highs" (the default; Clarabel for the QPs) or
-# "gurobi"
-const SOLVER = get(ENV, "SOLVER", "highs")
-SOLVER in ("highs", "gurobi") || error("SOLVER=$SOLVER: not highs or gurobi")
-SOLVER == "gurobi" && @eval using Gurobi
-
-# With Gurobi, each environment holds a connection to the license server, so
-# all the models share Threads.nthreads() environments, created once: block b
-# of the oracle uses environment env_slot(b, K) (see use_gurobi_envs!), and the
-# models of the methods, solved between evaluations, use the first one. An
-# environment must not be used by two threads at once, so evaluate! solves the
-# blocks of an environment one after the other, in one task.
-const GUROBI_ENVS =
-    SOLVER == "gurobi" ? [Gurobi.Env(; output_flag = 0) for _ in 1:Threads.nthreads()] : []
+# The oracle MIPs and the models of the methods are solved by Gurobi (HiGHS is
+# not used: the presolve of HiGHS 1.15.1 can return a suboptimal block solution
+# with status OPTIMAL and the same bound, on the unit g42 of or-lib/50_0_1_w).
+#
+# Each Gurobi environment holds a license token, so all the models share
+# GUROBI_ENVS environments (the environment variable, Threads.nthreads() by
+# default), created once: block b of the oracle uses environment env_slot(b,
+# K) (see use_gurobi_envs!), and the models of the methods, solved between
+# evaluations, use the first one. An environment must not be used by two
+# threads at once, so evaluate! solves the MIP blocks of an environment one
+# after the other, in one task. The blocks of the dynamic program use no
+# environment and are solved by all the threads, so that the methods need
+# one environment (bench.sh), and dw.jl, which solves every block by MIP, one
+# per thread.
+const GUROBI_ENVS = [
+    Gurobi.Env(; output_flag = 0) for
+    _ in 1:parse(Int, get(ENV, "GUROBI_ENVS", string(Threads.nthreads())))
+]
 env_slot(b, K) = mod1(b, K)
 
 # Stops after `time_limit` seconds, or once the certified value of L(π) is at
@@ -79,6 +82,19 @@ function evaluate!(
 )
     start = time()
     blocks = Vector{Any}(undef, length(oracle.blocks))
+    dp = get(DP_BLOCKS, oracle, nothing)
+    # the blocks of the dynamic program, on all the threads; the others, and
+    # the fallbacks, by MIP
+    mip = trues(length(oracle.blocks))
+    if dp !== nothing
+        Threads.@threads :greedy for b in eachindex(oracle.blocks)
+            dp[b] === nothing && continue
+            Threads.atomic_add!(DP_CALLS, 1)
+            r = solve_dp(dp[b], π)
+            r === nothing && (Threads.atomic_add!(DP_FALLBACKS, 1); continue)
+            blocks[b], mip[b] = r, false
+        end
+    end
     function solve(b)
         model = oracle.blocks[b].model
         set_attribute(model, MOI.RelativeGapTolerance(), gap)
@@ -87,15 +103,9 @@ function evaluate!(
         blocks[b] = (; r..., cost)
         return
     end
-    if SOLVER == "gurobi"
-        K = length(GUROBI_ENVS)
-        @sync for k in 1:K
-            Threads.@spawn foreach(solve, k:K:length(oracle.blocks))
-        end
-    else
-        Threads.@threads :greedy for b in eachindex(oracle.blocks)
-            solve(b)
-        end
+    K = length(GUROBI_ENVS)
+    @sync for k in 1:K
+        Threads.@spawn foreach(solve, filter(b -> mip[b] && env_slot(b, K) == k, eachindex(mip)))
     end
     timed || (trace.start += time() - start)
     L = sum(r.value for r in blocks)
@@ -125,40 +135,24 @@ function price_box(oracle; radius = 1.0)
 end
 
 # Optimizers of the oracle blocks (MIPs, solved up to the relative gap 1e-9 by
-# default), of the column generation masters (LPs, with duals) and of the
-# bundle and smoothing models (QPs). With HiGHS, the QPs are solved by
-# Clarabel, as the HiGHS QP solver can stall on them.
-mip_optimizer(env = 1) =
-    SOLVER == "gurobi" ?
-    optimizer_with_attributes(
-        () -> Gurobi.Optimizer(GUROBI_ENVS[env]),
-        "OutputFlag" => 0,
-        "MIPGap" => 1e-9,
-        "Threads" => 1,
-    ) :
-    optimizer_with_attributes(
-        HiGHS.Optimizer,
-        "output_flag" => false,
-        "mip_rel_gap" => 1e-9,
-        "threads" => 1,
-    )
-lp_optimizer() =
-    SOLVER == "gurobi" ?
-    optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENVS[1]), "OutputFlag" => 0, "Threads" => 1) :
-    optimizer_with_attributes(
-        HiGHS.Optimizer,
-        "output_flag" => false,
-        "threads" => 1,
-    )
-qp_optimizer() =
-    SOLVER == "gurobi" ?
-    optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENVS[1]), "OutputFlag" => 0, "Threads" => 1) :
-    optimizer_with_attributes(Clarabel.Optimizer, "verbose" => false)
+# default; with Gurobi, without presolve, which takes most of the time on
+# these small MIPs: the oracle is 1.4 to 4.8 times faster on or-lib, ca and
+# ferc, with the same values), of the column generation masters (LPs, with
+# duals) and of the bundle and smoothing models (QPs).
+mip_optimizer(env = 1) = optimizer_with_attributes(
+    () -> Gurobi.Optimizer(GUROBI_ENVS[env]),
+    "OutputFlag" => 0,
+    "MIPGap" => 1e-9,
+    "Presolve" => 0,
+    "Threads" => 1,
+)
+lp_optimizer(env = 1) =
+    optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENVS[env]), "OutputFlag" => 0, "Threads" => 1)
+qp_optimizer(env = 1) = lp_optimizer(env)
 
 # Moves block b of the oracle (built with mip_optimizer()) to its Gurobi
 # environment
 function use_gurobi_envs!(oracle)
-    SOLVER == "gurobi" || return oracle
     K = length(GUROBI_ENVS)
     for (b, blk) in enumerate(oracle.blocks)
         set_optimizer(blk.model, mip_optimizer(env_slot(b, K)))
@@ -169,3 +163,5 @@ end
 
 # Projection of the subgradient methods onto π ≥ lower
 project(oracle, π) = max.(π, oracle.lower)
+
+include("dp.jl")

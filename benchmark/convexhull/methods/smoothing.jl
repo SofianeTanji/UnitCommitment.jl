@@ -5,15 +5,18 @@
 #
 # where x are all the block variables and x_lp their values in the LP
 # relaxation. L_σ is smooth, with ∇L_σ(π) = -Σ_b g_b(x̄_b) at the minimizers
-# x̄_b. Blocks without integer variables are solved directly as QPs, by
-# Clarabel. For the other blocks, x̄_b is found by column generation: a restricted master QP over
+# x̄_b. Blocks without integer variables are solved directly as QPs. For the
+# other blocks, x̄_b is found by column generation: a restricted master QP over
 # convex combinations of stored block solutions, and a pricing MILP at the
 # linearization of the prox term, until the certified Frank-Wolfe gap is at
 # most τ (or after max_rounds rounds). The columns are kept between calls.
 #
 # The iterates are π_{k+1} = clamp(y_k + η ∇L_σ(y_k), box) and y_{k+1} =
 # π_{k+1} + (k - 1) / (k + 2) (π_{k+1} - π_k). L is evaluated at π_k only for
-# the trace, outside the run time.
+# the trace, outside the run time. The models of block b use its Gurobi
+# environment env_slot(b, K), and the blocks of an environment are solved in
+# one task (see methods/common.jl): the pricing MILPs are not solved by the
+# dynamic program, so this method needs one environment per thread.
 
 # Column generation state of one block with integer variables: columns V_j
 # (values of the block variables x), their cost and coupling shares a_j, and
@@ -35,7 +38,7 @@ end
 function SmoothBlock(oracle, b)
     blk = oracle.blocks[b]
     x = collect(keys(blk.x_lp))
-    master = Model(qp_optimizer())
+    master = Model(qp_optimizer(env_slot(b, length(GUROBI_ENVS))))
     set_silent(master)
     return SmoothBlock(
         x,
@@ -80,8 +83,7 @@ function add_column!(S::SmoothBlock, oracle, b)
 end
 
 # Share of a block without integer variables: its QP with the prox term,
-# solved by Clarabel on a copy of the block model (the HiGHS QP solver fails
-# on some of these blocks)
+# solved on a copy of the block model
 function continuous_share(S, oracle, b, π, σ)
     blk = oracle.blocks[b]
     obj = copy(blk.cost)
@@ -90,12 +92,11 @@ function continuous_share(S, oracle, b, π, σ)
     end
     prox = (σ / 2) * sum((S.x[i] - S.xr[i])^2 for i in eachindex(S.x))
     @objective(blk.model, Min, obj + prox)
-    qp = MOI.instantiate(Clarabel.Optimizer; with_bridge_type = Float64)
-    MOI.set(qp, MOI.Silent(), true)
+    qp = MOI.instantiate(qp_optimizer(env_slot(b, length(GUROBI_ENVS))); with_bridge_type = Float64)
     map = MOI.copy_to(qp, backend(blk.model))
     MOI.optimize!(qp)
     status = MOI.get(qp, MOI.TerminationStatus())
-    status in (MOI.OPTIMAL, MOI.ALMOST_OPTIMAL) || error("block $(blk.name): $status")
+    status == MOI.OPTIMAL || error("block $(blk.name): $status")
     x = v -> MOI.get(qp, MOI.VariablePrimal(), map[index(v)])
     return sparsevec(blk.rows, value.(x, blk.g), length(oracle.keys))
 end
@@ -153,8 +154,11 @@ function fgm_ch(
     π_prev, y = π0, π0
     for k in Iterators.countfrom(1)
         shares = Vector{Any}(undef, length(S))
-        Threads.@threads :greedy for b in eachindex(S)
-            shares[b] = smooth_share!(S[b], oracle, b, y, σ, τ, max_rounds)
+        K = length(GUROBI_ENVS)
+        @sync for e in 1:K
+            Threads.@spawn for b in filter(b -> env_slot(b, K) == e, eachindex(S))
+                shares[b] = smooth_share!(S[b], oracle, b, y, σ, τ, max_rounds)
+            end
         end
         π = clamp.(y .- η .* Vector(sum(shares)), lo, hi)
         r = evaluate!(trace, oracle, π, stop; timed = false)

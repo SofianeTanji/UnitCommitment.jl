@@ -5,8 +5,9 @@
 #
 #   sbatch --array=1-$(wc -l < tasks/coarse.txt) bench.sh tasks/coarse.txt traces/tune
 #
-# With SOLVER=gurobi in the environment of sbatch, the oracle and the models
-# of the methods are solved by Gurobi, from the module of the cluster.
+# The oracle and the models of the methods are solved by Gurobi, from the
+# module of the cluster, with one environment (license token) per job, or one
+# per thread for the jobs of fgm_ch (tasks/*_mip.txt, see plan.jl).
 #
 #SBATCH --job-name=chp-bench
 #SBATCH --ntasks=1
@@ -17,17 +18,19 @@
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
-if [ "${SOLVER:-highs}" = gurobi ]; then
-    set +u # Lmod fails on unset variables
-    module load releases/2025b Gurobi/13.0.1-GCCcore-14.3.0
-    set -u
-    export GUROBI_JL_USE_GUROBI_JLL=false
-fi
+set +u # Lmod fails on unset variables
+module load releases/2025b Gurobi/13.0.1-GCCcore-14.3.0
+set -u
+export GUROBI_JL_USE_GUROBI_JLL=false
 tasks=$1
 out=$2
 line=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$tasks")
+case " $line " in
+*" fgm_ch"*) export GUROBI_ENVS=$SLURM_CPUS_PER_TASK ;;
+*) export GUROBI_ENVS=1 ;;
+esac
 echo "$line"
-echo "on $(hostname), $SLURM_CPUS_PER_TASK threads, solver ${SOLVER:-highs}"
+echo "on $(hostname), $SLURM_CPUS_PER_TASK threads, $GUROBI_ENVS Gurobi environment(s)"
 
 # The line is the instance name followed by the runs
 # shellcheck disable=SC2086

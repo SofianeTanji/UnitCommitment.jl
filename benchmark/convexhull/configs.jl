@@ -3,7 +3,8 @@
 # Every configuration has at most one tuned parameter; the others are fixed
 # below. The bundle methods are run with all combinations of their switches:
 # cuts (1: aggregated, 4: clustered, 0: one model per block), preconditioning
-# and inexact oracle (inexact = 0.1, max_gap = 1e-2).
+# and inexact oracle (inexact = 0.1, max_gap = 1e-2). BLM and BPLM also run
+# with the trust region of the thesis (-tr), without preconditioning.
 #
 # Tuned parameters are relative to the instance: the value v of the grid is
 # passed to the method as v · scale, where scale is P = ‖π0‖∞ for prices
@@ -51,6 +52,13 @@ function bundle_configs()
             Config(label, method, fixed; tuned = :t, scale = :P2F) :
             Config(label, method, fixed; tuned = :α, grid = :lin, range = (0.1, 1.0)),
         )
+    end
+    for base in ("blm", "bplm"), cuts in (1, 4, 0), inexact in (false, true)
+        label =
+            base * "-" * Dict(1 => "agg", 4 => "k4", 0 => "block")[cuts] * "-tr" *
+            (inexact ? "-inexact" : "")
+        fixed = Dict{Symbol,Any}(:cuts => cuts, :trust_region => true, :inexact => inexact ? 0.1 : 0.0)
+        push!(configs, Config(label, base, fixed; tuned = :α, grid = :lin, range = (0.1, 1.0)))
     end
     return configs
 end
