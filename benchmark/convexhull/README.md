@@ -93,7 +93,9 @@ decreasing estimated time (the longest first), and prints the caps `%M` of the
 two arrays that stay within 60 tokens (`TOKENS=<n>` for another budget) and
 48 jobs (`MAX_JOBS`: the CPU limit per user of NIC6, 384 cores; beyond it, the
 jobs wait with the reason `QOSMaxCpuPerUserLimit`), and minimize the
-estimated makespan, with both arrays running at the same time. When the
+estimated makespan, with both arrays running at the same time. NIC6 also
+accepts at most 400 submitted jobs per user, running and pending
+(`QOSMaxSubmitJobPerUserLimit`), hence 27 runs per evaluation job. When the
 `*_mip.txt` array is done, its slots can go to the other one:
 `scontrol update JobId=<array job id> ArrayTaskThrottle=48`.
 

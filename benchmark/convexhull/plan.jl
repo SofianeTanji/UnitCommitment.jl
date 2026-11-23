@@ -13,7 +13,7 @@
 #   select  tuned.json: the best value of each configuration on the tuning
 #           instance of each dataset, from all the traces in traces/tune
 #   eval    tasks/eval.txt: every configuration on each benchmark instance
-#           that is not a tuning instance, 12 runs per job
+#           that is not a tuning instance, at most RUNS_PER_JOB runs per job
 #
 # With a regex, each step only covers the configurations whose label matches
 # it (e.g. '-tr' for the trust region variants): the task files get the
@@ -77,6 +77,12 @@ tuned_configs() = filter(c -> c.tuned !== nothing, SELECTED)
 const THREADS = 8                      # cpus-per-task of bench.sh
 const TOKENS = parse(Int, get(ENV, "TOKENS", "60"))
 const MAX_JOBS = parse(Int, get(ENV, "MAX_JOBS", "48"))
+# NIC6 accepts at most 400 submitted jobs per user (MaxSubmitPU, running and
+# pending): with 27 runs per job, the 81 configurations other than fgm_ch make
+# 3 jobs per evaluation instance (237 jobs, at most 27 × 300 s ≈ 2.3 h each,
+# within the 4 h of bench.sh), plus the 79 jobs of fgm_ch
+const RUNS_PER_JOB = 27
+const MAX_SUBMIT = 400
 
 label_of(run) = String(split(run, '@')[1])
 is_mip(line) = any(r -> CONFIG[label_of(r)].method == "fgm_ch", split(line)[2:end])
@@ -127,6 +133,8 @@ function write_tasks(file, lines)
     h1 > 0 && println("  sbatch --array=1-$(countlines(f1))%$c bench.sh $f1 ...   (1 token per job)")
     h2 > 0 && println("  sbatch --array=1-$(countlines(f2))%$m bench.sh $f2 ...   ($THREADS tokens per job)")
     println("  estimated makespan $(round(makespan; digits = 1)) h with $TOKENS tokens and $MAX_JOBS jobs")
+    n = sum(countlines(f) for (f, _, _) in files if haskey(hours, f))
+    n > MAX_SUBMIT && println("  WARNING: $n jobs, more than the $MAX_SUBMIT submitted jobs allowed per user")
 end
 
 function main(step)
@@ -167,7 +175,7 @@ function main(step)
         mip = filter(l -> CONFIG[l].method == "fgm_ch", labels)
         lines = [
             join([name; chunk], " ") for name in names for
-            group in (setdiff(labels, mip), mip) for chunk in Iterators.partition(group, 12)
+            group in (setdiff(labels, mip), mip) for chunk in Iterators.partition(group, RUNS_PER_JOB)
         ]
         println("$(length(names)) instances, $(length(labels)) configurations")
         write_tasks("tasks/eval$SUFFIX.txt", lines)
