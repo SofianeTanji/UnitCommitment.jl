@@ -25,11 +25,22 @@ const UC = UnitCommitment
 # after the other, in one task. The blocks of the dynamic program use no
 # environment and are solved by all the threads, so that the methods need
 # one environment (bench.sh), and dw.jl, which solves every block by MIP, one
-# per thread.
-const GUROBI_ENVS = [
-    Gurobi.Env(; output_flag = 0) for
-    _ in 1:parse(Int, get(ENV, "GUROBI_ENVS", string(Threads.nthreads())))
-]
+# per thread. The connection to the token server can fail for a while (Gurobi
+# error 10009 on a node of NIC6), so each environment is tried for up to 10
+# minutes before the job fails.
+function gurobi_env(; attempts = 20, wait = 30)
+    for attempt in 1:attempts
+        try
+            return Gurobi.Env(; output_flag = 0)
+        catch e
+            attempt == attempts && rethrow()
+            @warn "Gurobi environment, attempt $attempt of $attempts: retrying in $wait s" exception = e
+            sleep(wait)
+        end
+    end
+end
+const GUROBI_ENVS =
+    [gurobi_env() for _ in 1:parse(Int, get(ENV, "GUROBI_ENVS", string(Threads.nthreads())))]
 env_slot(b, K) = mod1(b, K)
 
 # Stops after `time_limit` seconds, or once the certified value of L(π) is at
